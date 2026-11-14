@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Lay Low — hide and seek on a shrinking map</title>
+  <meta name="description" content="GPS hide and seek for you and your friends. The zone shrinks, and every few minutes the seeker gets a ping.">
+  <meta name="theme-color" content="#ffffff">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23fff'/%3E%3Ccircle cx='16' cy='16' r='10' fill='none' stroke='%23C2188B' stroke-width='4'/%3E%3Ccircle cx='19' cy='14' r='3' fill='%23171A2B'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Martian+Mono:wght@500;700&family=Sofia+Sans+Extra+Condensed:wght@600;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ============================================================ Home -->
+<main id="home" class="home">
+  <div class="home-art" aria-hidden="true">
+    <svg viewBox="0 0 400 260" preserveAspectRatio="xMidYMid slice">
+      <rect width="400" height="260" fill="#FFD466"/>
+      <path d="M-10 46C52 14 118 74 190 42S322 2 410 52V-10H-10Z" fill="#9BD3A4"/>
+      <path d="M-10 206C66 172 134 232 222 206S338 180 410 216V270H-10Z" fill="#9BD3A4"/>
+      <path d="M60 96c22-14 52-8 60 12s-10 40-36 40-46-38-24-52Z" fill="#fff" opacity=".8"/>
+      <g fill="none" stroke="#B5651D" stroke-width="1.3" opacity=".75">
+        <path d="M-10 84C58 58 120 110 196 82S330 44 410 92"/>
+        <path d="M-10 110C60 86 124 136 200 108S332 72 410 118"/>
+        <path d="M-10 168C70 140 140 196 226 170S344 146 410 180"/>
+        <path d="M150 122c18-12 46-8 56 8s-2 34-28 36-46-32-28-44Z"/>
+        <path d="M164 132c10-6 24-4 30 4s0 16-14 18-26-16-16-22Z"/>
+      </g>
+      <path d="M262-10C250 58 304 92 292 150S334 232 322 270" fill="none" stroke="#2B7FD9" stroke-width="5"/>
+      <path d="M-10 152C76 122 160 172 240 132S362 122 410 102" fill="none" stroke="#171A2B" stroke-width="2.2" stroke-dasharray="8 5"/>
+      <g fill="#171A2B">
+        <rect x="92" y="150" width="16" height="10"/><rect x="114" y="158" width="10" height="10"/>
+        <rect x="318" y="96" width="14" height="14"/><rect x="338" y="104" width="10" height="8"/>
+        <rect x="216" y="60" width="12" height="9"/>
+      </g>
+      <circle class="art-zone" cx="196" cy="128" r="104" fill="none" stroke="#C2188B" stroke-width="5"/>
+      <circle class="art-ripple" cx="150" cy="104" r="10" fill="none" stroke="#C2188B" stroke-width="3"/>
+      <g stroke="#fff" stroke-width="2.5">
+        <circle cx="150" cy="104" r="6" fill="#E4572E"/>
+        <circle cx="236" cy="150" r="6" fill="#2B7FD9"/>
+        <circle cx="204" cy="96" r="6" fill="#7A5CD6"/>
+      </g>
+    </svg>
+  </div>
+
+  <div class="home-body">
+    <h1 class="wordmark" aria-label="Lay Low"><span>Lay</span><span>L<i class="ring"></i>w</span></h1>
+    <p class="lede">Hide and seek on a real map. The zone keeps shrinking, and every few minutes the seeker gets a ping.</p>
+
+    <form id="home-form" class="home-form" novalidate>
+      <label class="field">
+        <span>Your name</span>
+        <input id="name" type="text" maxlength="16" autocomplete="nickname" enterkeyhint="done" placeholder="What your friends call you">
+      </label>
+      <button type="button" id="btn-create" class="btn btn-ink">Create a room</button>
+      <div class="join">
+        <label class="field">
+          <span>Have a code?</span>
+          <input id="join-code" class="mono" type="text" maxlength="4" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="ABCD">
+        </label>
+        <button type="submit" id="btn-join" class="btn btn-course">Join room</button>
+      </div>
+      <p id="home-error" class="error" role="alert" hidden></p>
+    </form>
+
+    <details class="how">
+      <summary>How a round works</summary>
+      <ul>
+        <li>One of you creates a room and places the zone on the map. Everyone else joins with the 4-letter code.</li>
+        <li>Hiders get a head start. The seeker's screen stays dark until it ends.</li>
+        <li>At random moments a ping drops every hider's position onto the seeker's map, with a siren.</li>
+        <li>The zone shrinks and drifts. Stay outside it for 20 seconds and the seeker sees you live.</li>
+        <li>Found? Show the seeker your tag code. Caught hiders join the hunt.</li>
+        <li>Each hider carries a jammer: arm it to vanish from the next ping.</li>
+      </ul>
+      <p>Keep this page open with the screen on. Phones stop sharing location when the browser is in the background.</p>
+    </details>
+  </div>
+</main>
+
+<!-- ============================================================ Room -->
+<main id="room" class="room" hidden>
+  <div id="map" class="map"></div>
+
+  <header class="strip" id="strip">
+    <div class="cell cell-lead"><span class="k" id="c1k"></span><span class="v" id="c1v"></span></div>
+    <div class="cell"><span class="k" id="c2k"></span><span class="v" id="c2v"></span></div>
+    <div class="cell"><span class="k" id="c3k"></span><span class="v" id="c3v"></span></div>
+    <div class="cell"><span class="k" id="c4k"></span><span class="v" id="c4v"></span></div>
+  </header>
+
+  <div id="banner" class="banner" role="status" hidden></div>
+
+  <nav class="tools" aria-label="Map tools">
+    <button id="tool-me" type="button">Me</button>
+    <button id="tool-zone" type="button">Zone</button>
+    <button id="tool-night" type="button" aria-pressed="false">Night</button>
+    <button id="tool-sound" type="button" aria-pressed="true">Sound</button>
+  </nav>
+
+  <div id="blindfold" class="blindfold" hidden>
+    <p class="blind-k">Eyes shut. They're hiding.</p>
+    <p class="blind-time" id="blind-time">0:00</p>
+    <p class="blind-sub">Your map opens when the head start ends.</p>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <section class="sheet" id="sheet" aria-label="Game panel">
+    <button class="grip" id="grip" type="button" aria-label="Show or hide the panel" aria-expanded="true"></button>
+    <div class="sheet-body">
+
+      <div id="view-lobby" hidden>
+        <div class="lobby-head">
+          <div><span class="k">Room code</span><strong class="code" id="room-code">----</strong></div>
+          <button id="btn-invite" class="btn btn-line btn-sm" type="button">Share invite link</button>
+        </div>
+
+        <h2 class="h">Players <span id="player-count"></span></h2>
+        <ul id="players" class="players"></ul>
+
+        <div id="host-controls" hidden>
+          <p class="hint">Tap a role to switch it. With no seeker picked, one is chosen at random.</p>
+
+          <h2 class="h">Zone</h2>
+          <p class="hint">Tap the map to move the zone. Hiders have to stay inside it.</p>
+          <div class="zone-row">
+            <label class="range">
+              <span>Radius <b id="radius-out">400 m</b></span>
+              <input id="radius" type="range" min="75" max="2000" step="25" value="400">
+            </label>
+            <button id="btn-zone-me" class="btn btn-line btn-sm" type="button">Centre on me</button>
+          </div>
+
+          <h2 class="h">Rules</h2>
+          <div class="rules" id="rules"></div>
+
+          <button id="btn-start" class="btn btn-course btn-big" type="button">Start the game</button>
+          <p class="hint" id="start-hint"></p>
+        </div>
+
+        <div id="guest-info" hidden>
+          <h2 class="h">Rules</h2>
+          <ul class="summary" id="rules-summary"></ul>
+          <p class="hint" id="guest-wait"></p>
+        </div>
+
+        <div class="foot"><button class="link" data-act="leave" type="button">Leave room</button></div>
+      </div>
+
+      <div id="view-hider" hidden>
+        <p class="status" id="hider-status"></p>
+        <div class="tag">
+          <div><span class="k">Your tag code</span><strong class="code big" id="tag-code">----</strong></div>
+          <p class="hint">Found? Show this to the seeker. They type it in and you're caught.</p>
+        </div>
+        <p class="line" id="hider-ping"></p>
+        <div class="actions">
+          <button id="btn-jam" class="btn btn-ink" type="button">Jam the next ping</button>
+          <button id="btn-caught" class="btn btn-line" type="button">I'm caught</button>
+        </div>
+        <div class="foot">
+          <button class="link host-only" data-act="end" type="button" hidden>End game for everyone</button>
+          <button class="link" data-act="leave" type="button">Leave game</button>
+        </div>
+      </div>
+
+      <div id="view-hunter" hidden>
+        <p class="status" id="hunter-status"></p>
+        <form id="tag-form" class="tag-form" novalidate>
+          <label class="field">
+            <span>Hider's tag code</span>
+            <input id="tag-input" class="mono" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" placeholder="0000">
+          </label>
+          <button class="btn btn-course" type="submit">Tag them</button>
+        </form>
+        <p class="error" id="tag-error" role="alert" hidden></p>
+        <ul class="chips" id="hider-chips"></ul>
+        <div class="foot">
+          <button class="link host-only" data-act="end" type="button" hidden>End game for everyone</button>
+          <button class="link" data-act="leave" type="button">Leave game</button>
+        </div>
+      </div>
+
+      <div id="view-ended" hidden>
+        <span class="k">Round over</span>
+        <h2 class="end-title" id="end-title"></h2>
+        <p class="hint" id="end-sub"></p>
+        <ol class="results" id="results"></ol>
+        <button id="btn-again" class="btn btn-ink btn-big" type="button" hidden>Back to the lobby</button>
+        <p class="hint" id="end-wait" hidden>Waiting for the host to set up the next round.</p>
+        <div class="foot"><button class="link" data-act="leave" type="button">Leave room</button></div>
+      </div>
+
+    </div>
+  </section>
+
+  <div id="flash" class="flash" hidden>
+    <p class="flash-big" id="flash-big">Ping</p>
+    <p class="flash-small" id="flash-small"></p>
+  </div>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
