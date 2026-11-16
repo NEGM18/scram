@@ -74,7 +74,8 @@
         <li>Hiders get a head start. The seeker's screen stays dark until it ends.</li>
         <li>At random moments a ping drops every hider's position onto the seeker's map, with a siren.</li>
         <li>The zone shrinks and drifts. Stay outside it for 20 seconds and the seeker sees you live.</li>
-        <li>Found? Show the seeker your tag code. Caught hiders join the hunt.</li>
+        <li>Found someone? Get within a couple of metres and tap Found next to their name. The game checks both phones' GPS, so nobody can call a catch from across the park. Caught hiders join the hunt.</li>
+        <li>Safe points open at random, far from every hider. The first hider inside can't be caught for a few minutes, watches the seekers live and earns a jammer. The catch: the seekers watch them live too.</li>
         <li>Each hider carries a jammer: arm it to vanish from the next ping.</li>
       </ul>
       <p>Keep this page open with the screen on. Phones stop sharing location when the browser is in the background.</p>
@@ -98,6 +99,7 @@
   <nav class="tools" aria-label="Map tools">
     <button id="tool-me" type="button">Me</button>
     <button id="tool-zone" type="button">Zone</button>
+    <button id="tool-safe" type="button" hidden>Safe</button>
     <button id="tool-night" type="button" aria-pressed="false">Night</button>
     <button id="tool-sound" type="button" aria-pressed="true">Sound</button>
   </nav>
@@ -154,9 +156,10 @@
 
       <div id="view-hider" hidden>
         <p class="status" id="hider-status"></p>
+        <p class="safe-note" id="hider-safe" hidden></p>
         <div class="tag">
-          <div><span class="k">Your tag code</span><strong class="code big" id="tag-code">----</strong></div>
-          <p class="hint">Found? Show this to the seeker. They type it in and you're caught.</p>
+          <div><span class="k">Backup tag code</span><strong class="code" id="tag-code">----</strong></div>
+          <p class="hint">A seeker catches you by getting within reach and tapping Found next to your name. If GPS lets them down, they can type this code instead.</p>
         </div>
         <p class="line" id="hider-ping"></p>
         <div class="actions">
@@ -171,15 +174,22 @@
 
       <div id="view-hunter" hidden>
         <p class="status" id="hunter-status"></p>
-        <form id="tag-form" class="tag-form" novalidate>
-          <label class="field">
-            <span>Hider's tag code</span>
-            <input id="tag-input" class="mono" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" placeholder="0000">
-          </label>
-          <button class="btn btn-course" type="submit">Tag them</button>
-        </form>
-        <p class="error" id="tag-error" role="alert" hidden></p>
-        <ul class="chips" id="hider-chips"></ul>
+        <h2 class="h">Found someone?</h2>
+        <p class="hint">Get within reach, then tap Found next to their name. Both phones' GPS decides, so a call from too far away fails and locks you out for 20 seconds.</p>
+        <ul class="targets" id="targets"></ul>
+        <p class="error" id="catch-msg" role="alert" hidden></p>
+        <details class="backup">
+          <summary>GPS not registering a catch?</summary>
+          <p class="hint">Ask the hider for the backup tag code on their screen.</p>
+          <form id="tag-form" class="tag-form" novalidate>
+            <label class="field">
+              <span>Hider's tag code</span>
+              <input id="tag-input" class="mono" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" placeholder="0000">
+            </label>
+            <button class="btn btn-ink" type="submit">Tag them</button>
+          </form>
+          <p class="error" id="tag-error" role="alert" hidden></p>
+        </details>
         <div class="foot">
           <button class="link host-only" data-act="end" type="button" hidden>End game for everyone</button>
           <button class="link" data-act="leave" type="button">Leave game</button>

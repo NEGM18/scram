@@ -24,6 +24,10 @@ create table hideseek.rooms (
   ping_fuzz_m integer not null default 0,
   reveal_seekers boolean not null default true,
   jammers integer not null default 1,
+  catch_m integer not null default 2,
+  safe_min_s integer not null default 240,   -- a safe point opens every safe_min_s..safe_max_s
+  safe_max_s integer not null default 420,   -- 0 switches safe points off
+  safe_seconds integer not null default 180,
   -- runtime
   final_lat double precision,
   final_lng double precision,
@@ -32,6 +36,7 @@ create table hideseek.rooms (
   ends_at timestamptz,
   ended_at timestamptz,
   next_ping_at timestamptz,
+  next_safe_at timestamptz,                  -- when a safe point next opens or runs out
   last_ping_at timestamptz,
   ping_seq integer not null default 0,
   winner text,
@@ -56,10 +61,41 @@ create table hideseek.players (
   acc real,
   loc_at timestamptz,
   outside_since timestamptz,
+  catch_block_until timestamptz,   -- a "found you" call from too far away locks the caller out briefly
+  immune_until timestamptz,        -- getaway time after a safe point ends
+  safe_away_since timestamptz,     -- holding a safe point but standing outside it
   last_seen timestamptz not null default now(),
   joined_at timestamptz not null default now()
 );
 create index players_room_idx on hideseek.players(room_code);
+
+-- The hidden track: one row per player per second while a game runs, and only the last
+-- half minute is kept. Nobody is ever shown this; it exists so hs_catch can check that a
+-- seeker really was next to the hider they claim to have found.
+create table hideseek.fixes (
+  player_id uuid not null references hideseek.players(id) on delete cascade,
+  at timestamptz not null default now(),
+  lat double precision not null,
+  lng double precision not null,
+  acc real,
+  primary key (player_id, at)
+);
+
+-- A safe point is a circle, and the first hider to step inside holds it.
+create table hideseek.safe_points (
+  id bigint generated always as identity primary key,
+  room_code text not null references hideseek.rooms(code) on delete cascade,
+  lat double precision not null,
+  lng double precision not null,
+  radius_m integer not null,
+  spawned_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  claimed_by uuid references hideseek.players(id) on delete set null,
+  claimed_at timestamptz,
+  ended_at timestamptz
+);
+-- at most one open safe point per room
+create unique index safe_points_live_idx on hideseek.safe_points(room_code) where ended_at is null;
 
 create table hideseek.pings (
   id bigint generated always as identity primary key,
@@ -90,6 +126,8 @@ alter table hideseek.rooms enable row level security;
 alter table hideseek.players enable row level security;
 alter table hideseek.pings enable row level security;
 alter table hideseek.events enable row level security;
+alter table hideseek.fixes enable row level security;
+alter table hideseek.safe_points enable row level security;
 
 -- ---------------------------------------------------------------- helpers
 
@@ -169,16 +207,172 @@ begin
   radius := r.zone_radius_m + (rf - r.zone_radius_m) * p;
 end $$;
 
--- Advances the game clock: fires a ping when one is due and ends the game on time.
--- There is no server timer; this runs whenever any player checks in.
+-- ---------------------------------------------------------------- catching and safe points
+
+-- The hidden proximity check behind "found you". It compares the two phones' tracks over
+-- the last few seconds rather than one reading each, so a hider who bolts while the seeker
+-- is still tapping is judged at their closest approach. Phone GPS is only good to a few
+-- metres, so each phone's own reported uncertainty (capped at 10 m) is added to the catch
+-- distance. A hider whose phone has gone quiet is checked against where it was last seen.
+create function hideseek.was_near(p_seeker uuid, t hideseek.players, p_reach integer) returns boolean
+language sql stable set search_path = '' as $$
+  select exists (
+           select 1
+             from hideseek.fixes s
+             join hideseek.fixes h
+               on h.player_id = t.id
+              and h.at between s.at - interval '3 seconds' and s.at + interval '3 seconds'
+            where s.player_id = p_seeker and s.at > now() - interval '12 seconds'
+              and hideseek.dist_m(s.lat, s.lng, h.lat, h.lng)
+                  <= p_reach + least(coalesce(s.acc, 0), 10) + least(coalesce(h.acc, 0), 10))
+      or ( t.lat is not null
+           and not exists (select 1 from hideseek.fixes h
+                            where h.player_id = t.id and h.at > now() - interval '15 seconds')
+           and exists (
+                 select 1 from hideseek.fixes s
+                  where s.player_id = p_seeker and s.at > now() - interval '12 seconds'
+                    and hideseek.dist_m(s.lat, s.lng, t.lat, t.lng)
+                        <= p_reach + least(coalesce(s.acc, 0), 10) + least(coalesce(t.acc, 0), 10)))
+$$;
+
+-- A hider cannot be caught while holding a safe point, or during the getaway after it.
+create function hideseek.is_safe(p hideseek.players) returns boolean
+language sql stable set search_path = '' as $$
+  select coalesce(p.immune_until > now(), false)
+      or exists (select 1 from hideseek.safe_points s
+                  where s.room_code = p.room_code and s.ended_at is null and s.claimed_by = p.id)
+$$;
+
+-- How long until the next safe point opens. Null when safe points are switched off.
+create function hideseek.safe_delay(r hideseek.rooms) returns interval
+language sql volatile set search_path = '' as $$
+  select case when r.safe_max_s > 0
+              then make_interval(secs => r.safe_min_s + random() * (r.safe_max_s - r.safe_min_s)) end
+$$;
+
+-- Closes the open safe point. The caller must already hold the room lock.
+create function hideseek.close_safe(p_code text, p_reason text) returns void
+language plpgsql set search_path = '' as $$
+declare sp hideseek.safe_points; r hideseek.rooms; v_name text;
+begin
+  select * into sp from hideseek.safe_points where room_code = p_code and ended_at is null for update;
+  if not found then return; end if;
+  select * into r from hideseek.rooms where code = p_code;
+  update hideseek.safe_points set ended_at = now() where id = sp.id;
+  if sp.claimed_by is not null then
+    -- whoever held it gets a 30 second getaway, so a seeker cannot just camp the edge
+    update hideseek.players
+       set safe_away_since = null,
+           immune_until = case when status = 'active' then now() + interval '30 seconds' end
+     where id = sp.claimed_by
+     returning name into v_name;
+  end if;
+  update hideseek.rooms set next_safe_at = now() + hideseek.safe_delay(r) where code = p_code;
+  perform hideseek.log(p_code, 'safe_end',
+    jsonb_build_object('reason', p_reason, 'id', sp.claimed_by, 'name', v_name));
+end $$;
+
+-- Opens a safe point. It is a circle rather than a spot, because GPS cannot tell a doorway
+-- from the street outside it. It lands inside where the zone will still be when it runs
+-- out, and far from every hider, so nobody is handed it for free.
+-- The caller must already hold the room lock.
+create function hideseek.spawn_safe(r hideseek.rooms) returns void
+language plpgsql set search_path = '' as $$
+declare
+  c_radius constant integer := 15;   -- metres
+  c_open constant integer := 240;    -- seconds it stays open if nobody reaches it
+  z record; v_until timestamptz; v_min double precision; v_max double precision := 350;
+  a double precision; d double precision; c_lat double precision; c_lng double precision;
+  v_near double precision; v_pen double precision;
+  b_lat double precision; b_lng double precision; b_pen double precision;
+begin
+  v_until := least(r.ends_at, now() + make_interval(secs => c_open + r.safe_seconds));
+  select * into z from hideseek.zone_at(r, v_until);
+  if r.ends_at - now() < interval '90 seconds' or z.radius is null or z.radius < 3 * c_radius then
+    update hideseek.rooms set next_safe_at = null where code = r.code;   -- no more this round
+    return;
+  end if;
+
+  -- aim for 150 to 350 m from the nearest hider (closer when the zone is small)
+  v_min := least(150, z.radius * 0.5);
+  for i in 1..40 loop
+    a := random() * 2 * pi();
+    d := sqrt(random()) * (z.radius - c_radius - 5);
+    c_lat := z.lat + d * cos(a) / 111320.0;
+    c_lng := z.lng + d * sin(a) / (111320.0 * cos(radians(z.lat)));
+    select min(hideseek.dist_m(c_lat, c_lng, p.lat, p.lng)) into v_near
+      from hideseek.players p
+     where p.room_code = r.code and p.role = 'hider' and p.status = 'active' and p.lat is not null;
+    v_pen := case when v_near is null then 0
+                  when v_near < v_min then v_min - v_near
+                  when v_near > v_max then v_near - v_max
+                  else 0 end;
+    if b_pen is null or v_pen < b_pen then
+      b_lat := c_lat; b_lng := c_lng; b_pen := v_pen;
+    end if;
+    exit when b_pen = 0;
+  end loop;
+
+  insert into hideseek.safe_points(room_code, lat, lng, radius_m, expires_at)
+  values (r.code, b_lat, b_lng, c_radius, now() + make_interval(secs => c_open));
+  update hideseek.rooms set next_safe_at = now() + make_interval(secs => c_open) where code = r.code;
+  perform hideseek.log(r.code, 'safe_spawn', '{}'::jsonb);
+end $$;
+
+-- Runs each time an active hider reports a position: claims the open safe point if they
+-- are the first one inside it, and ends their hold once they have walked off it.
+-- p_claim is false for old copies of the site that cannot draw safe points.
+create function hideseek.safe_step(r hideseek.rooms, me hideseek.players,
+  p_lat double precision, p_lng double precision, p_acc real, p_claim boolean) returns void
+language plpgsql set search_path = '' as $$
+declare sp hideseek.safe_points; d double precision;
+begin
+  select * into sp from hideseek.safe_points where room_code = r.code and ended_at is null;
+  if not found then return; end if;
+  d := hideseek.dist_m(p_lat, p_lng, sp.lat, sp.lng);
+
+  if sp.claimed_by is null then
+    if not p_claim or d > sp.radius_m or now() >= sp.expires_at then return; end if;
+    -- the room lock decides who was first when two hiders arrive together
+    perform 1 from hideseek.rooms where code = r.code and status = 'playing' for update;
+    if not found then return; end if;
+    if not exists (select 1 from hideseek.players where id = me.id and status = 'active') then return; end if;
+    update hideseek.safe_points
+       set claimed_by = me.id, claimed_at = now(), expires_at = now() + make_interval(secs => r.safe_seconds)
+     where id = sp.id and claimed_by is null and ended_at is null;
+    if not found then return; end if;
+    update hideseek.players
+       set jammers_left = jammers_left + 1, safe_away_since = null, immune_until = null
+     where id = me.id;
+    update hideseek.rooms set next_safe_at = now() + make_interval(secs => r.safe_seconds) where code = r.code;
+    perform hideseek.log(r.code, 'safe_claim', jsonb_build_object('id', me.id, 'name', me.name));
+
+  elsif sp.claimed_by = me.id then
+    -- GPS wobbles, so leaving only counts after 6 seconds clearly outside the circle
+    if d > sp.radius_m + least(coalesce(p_acc, 0), 10) + 3 then
+      if me.safe_away_since is null then
+        update hideseek.players set safe_away_since = now() where id = me.id;
+      elsif me.safe_away_since < now() - interval '6 seconds' then
+        perform 1 from hideseek.rooms where code = r.code for update;
+        perform hideseek.close_safe(r.code, 'left');
+      end if;
+    elsif me.safe_away_since is not null then
+      update hideseek.players set safe_away_since = null where id = me.id;
+    end if;
+  end if;
+end $$;
+
+-- Advances the game clock: fires a ping when one is due, opens and closes safe points,
+-- and ends the game on time. There is no server timer; this runs whenever any player checks in.
 create function hideseek.tick(p_code text) returns void
 language plpgsql set search_path = '' as $$
 declare
-  r hideseek.rooms; p hideseek.players;
+  r hideseek.rooms; p hideseek.players; sp hideseek.safe_points;
   v_seq int; a double precision; d double precision; v_jam int := 0; v_n int := 0;
 begin
   select * into r from hideseek.rooms where code = p_code;
-  if not found or r.status <> 'playing' or now() < least(r.ends_at, r.next_ping_at) then return; end if;
+  if not found or r.status <> 'playing'
+     or now() < least(r.ends_at, r.next_ping_at, coalesce(r.next_safe_at, 'infinity')) then return; end if;
 
   select * into r from hideseek.rooms where code = p_code for update;
   if r.status <> 'playing' then return; end if;
@@ -188,6 +382,18 @@ begin
     perform hideseek.log(p_code, 'end', jsonb_build_object('winner', 'hiders'));
     return;
   end if;
+
+  if r.next_safe_at is not null and now() >= r.next_safe_at then
+    select * into sp from hideseek.safe_points where room_code = p_code and ended_at is null;
+    if not found then
+      perform hideseek.spawn_safe(r);
+    elsif now() >= sp.expires_at then
+      perform hideseek.close_safe(p_code, case when sp.claimed_by is null then 'expired' else 'timeup' end);
+    else
+      update hideseek.rooms set next_safe_at = sp.expires_at where code = p_code;
+    end if;
+  end if;
+
   if now() < r.next_ping_at then return; end if;
 
   v_seq := r.ping_seq + 1;
@@ -229,12 +435,18 @@ begin
   select * into r from hideseek.rooms where code = p_code for update;
   if r.status <> 'playing' then return null; end if;
   update hideseek.players
-     set status = 'caught', caught_at = now(), caught_by = p_by, jam_armed = false, outside_since = null
+     set status = 'caught', caught_at = now(), caught_by = p_by, jam_armed = false, outside_since = null,
+         immune_until = null, safe_away_since = null
    where id = p_target and room_code = p_code and status = 'active' and role = 'hider'
    returning * into t;
   if not found then return null; end if;
   select name into v_by from hideseek.players where id = p_by;
   perform hideseek.log(p_code, 'caught', jsonb_build_object('id', t.id, 'name', t.name, 'by', v_by));
+  -- giving up while holding the safe point closes it
+  if exists (select 1 from hideseek.safe_points
+              where room_code = p_code and ended_at is null and claimed_by = t.id) then
+    perform hideseek.close_safe(p_code, 'gone');
+  end if;
   if not exists (select 1 from hideseek.players where room_code = p_code and role = 'hider' and status = 'active') then
     update hideseek.rooms set status = 'ended', winner = 'seekers', ended_at = now() where code = p_code;
     perform hideseek.log(p_code, 'end', jsonb_build_object('winner', 'seekers'));
@@ -247,6 +459,10 @@ language plpgsql set search_path = '' as $$
 declare r hideseek.rooms; v_name text;
 begin
   select * into r from hideseek.rooms where code = p_code for update;
+  if exists (select 1 from hideseek.safe_points
+              where room_code = p_code and ended_at is null and claimed_by = p_target) then
+    perform hideseek.close_safe(p_code, 'gone');
+  end if;
   delete from hideseek.players where id = p_target and room_code = p_code returning name into v_name;
   if not found then return; end if;
   if not exists (select 1 from hideseek.players where room_code = p_code) then
@@ -336,9 +552,18 @@ begin
     ping_max_s    = least(3600, greatest(10, coalesce((s->>'ping_max_s')::int, ping_max_s))),
     ping_fuzz_m   = least(500, greatest(0, coalesce((s->>'ping_fuzz_m')::int, ping_fuzz_m))),
     reveal_seekers = coalesce((s->>'reveal_seekers')::boolean, reveal_seekers),
-    jammers       = least(3, greatest(0, coalesce((s->>'jammers')::int, jammers)))
+    jammers       = least(3, greatest(0, coalesce((s->>'jammers')::int, jammers))),
+    catch_m       = least(50, greatest(1, coalesce((s->>'catch_m')::int, catch_m))),
+    safe_min_s    = least(3600, greatest(0, coalesce((s->>'safe_min_s')::int, safe_min_s))),
+    safe_max_s    = least(3600, greatest(0, coalesce((s->>'safe_max_s')::int, safe_max_s))),
+    safe_seconds  = least(900, greatest(30, coalesce((s->>'safe_seconds')::int, safe_seconds)))
   where code = v_code;
-  update hideseek.rooms set ping_max_s = greatest(ping_max_s, ping_min_s) where code = v_code;
+  -- keep the ranges the right way round; a safe point range ending at 0 means "off"
+  update hideseek.rooms set
+    ping_max_s = greatest(ping_max_s, ping_min_s),
+    safe_min_s = case when safe_max_s > 0 then greatest(30, safe_min_s) else 0 end,
+    safe_max_s = case when safe_max_s > 0 then greatest(30, safe_min_s, safe_max_s) else 0 end
+  where code = v_code;
 end $$;
 
 create function public.hs_set_role(p_code text, p_pid uuid, p_secret uuid, p_target uuid, p_role text) returns void
@@ -376,8 +601,11 @@ begin
 
   delete from hideseek.pings where room_code = v_code;
   delete from hideseek.events where room_code = v_code;
+  delete from hideseek.safe_points where room_code = v_code;
+  delete from hideseek.fixes where player_id in (select id from hideseek.players where room_code = v_code);
   update hideseek.players
      set status = 'active', caught_at = null, caught_by = null, jam_armed = false, outside_since = null,
+         catch_block_until = null, immune_until = null, safe_away_since = null,
          tag_code = null, jammers_left = case when role = 'hider' then r.jammers else 0 end
    where room_code = v_code;
   for p in select * from hideseek.players where room_code = v_code and role = 'hider' loop
@@ -394,24 +622,63 @@ begin
     seek_at = now() + make_interval(secs => r.hide_seconds),
     ends_at = now() + make_interval(secs => r.hide_seconds + r.game_seconds),
     next_ping_at = now() + make_interval(secs => r.hide_seconds + r.ping_min_s + random() * (r.ping_max_s - r.ping_min_s)),
+    next_safe_at = now() + make_interval(secs => r.hide_seconds) + hideseek.safe_delay(r),
     final_lat = r.zone_lat + d * cos(a) / 111320.0,
     final_lng = r.zone_lng + d * sin(a) / (111320.0 * cos(radians(r.zone_lat)))
   where code = v_code;
   perform hideseek.log(v_code, 'start', '{}'::jsonb);
 end $$;
 
-create function public.hs_tag(p_code text, p_pid uuid, p_secret uuid, p_tag text) returns jsonb
+-- "Found you": the seeker picks a hider by name and the server decides, from the hidden
+-- track, whether the two phones really were within reach of each other. The distance is
+-- never sent back, and a call from too far away locks the caller out for 20 seconds, so
+-- the button cannot be mashed as a hot-or-cold radar.
+create function public.hs_catch(p_code text, p_pid uuid, p_secret uuid, p_target uuid) returns jsonb
 language plpgsql security definer set search_path = '' as $$
-declare v_code text := upper(p_code); me hideseek.players; r hideseek.rooms; v_target uuid; v_name text;
+declare
+  v_code text := upper(p_code); me hideseek.players; r hideseek.rooms; t hideseek.players;
+  v_name text; v_until timestamptz;
 begin
   me := hideseek.auth(v_code, p_pid, p_secret);
   select * into r from hideseek.rooms where code = v_code;
   if r.status <> 'playing' or now() < r.seek_at then raise exception 'NOT_SEEKING'; end if;
   if not (me.role = 'seeker' or me.status = 'caught') then raise exception 'SEEKERS_ONLY'; end if;
-  select id into v_target from hideseek.players
+  if me.catch_block_until > now() then raise exception 'CATCH_WAIT'; end if;
+  select * into t from hideseek.players
+   where id = p_target and room_code = v_code and role = 'hider' and status = 'active';
+  if not found then raise exception 'NOT_A_TARGET'; end if;
+  if hideseek.is_safe(t) then raise exception 'TARGET_SAFE'; end if;
+  if not exists (select 1 from hideseek.fixes
+                  where player_id = me.id and at > now() - interval '12 seconds') then
+    raise exception 'NO_FIX';
+  end if;
+  if t.lat is null then raise exception 'TARGET_NO_GPS'; end if;
+
+  if hideseek.was_near(me.id, t, r.catch_m) then
+    v_name := hideseek.mark_caught(v_code, t.id, me.id);
+    if v_name is null then raise exception 'NOT_A_TARGET'; end if;   -- someone else got there first
+    return jsonb_build_object('caught', true, 'name', v_name);
+  end if;
+
+  v_until := now() + interval '20 seconds';
+  update hideseek.players set catch_block_until = v_until where id = me.id;
+  return jsonb_build_object('caught', false, 'wait_until', hideseek.ms(v_until));
+end $$;
+
+-- The backup for when GPS lets a real catch down: the hider shows their tag code.
+create function public.hs_tag(p_code text, p_pid uuid, p_secret uuid, p_tag text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare v_code text := upper(p_code); me hideseek.players; r hideseek.rooms; t hideseek.players; v_name text;
+begin
+  me := hideseek.auth(v_code, p_pid, p_secret);
+  select * into r from hideseek.rooms where code = v_code;
+  if r.status <> 'playing' or now() < r.seek_at then raise exception 'NOT_SEEKING'; end if;
+  if not (me.role = 'seeker' or me.status = 'caught') then raise exception 'SEEKERS_ONLY'; end if;
+  select * into t from hideseek.players
    where room_code = v_code and role = 'hider' and status = 'active' and tag_code = btrim(coalesce(p_tag, ''));
   if not found then raise exception 'WRONG_CODE'; end if;
-  v_name := hideseek.mark_caught(v_code, v_target, me.id);
+  if hideseek.is_safe(t) then raise exception 'TARGET_SAFE'; end if;
+  v_name := hideseek.mark_caught(v_code, t.id, me.id);
   return jsonb_build_object('name', v_name);
 end $$;
 
@@ -453,13 +720,17 @@ begin
   r := hideseek.host(v_code, p_pid, p_secret);
   update hideseek.rooms
      set status = 'lobby', winner = null, started_at = null, seek_at = null, ends_at = null, ended_at = null,
-         next_ping_at = null, last_ping_at = null, ping_seq = 0, final_lat = null, final_lng = null
+         next_ping_at = null, last_ping_at = null, ping_seq = 0, final_lat = null, final_lng = null,
+         next_safe_at = null
    where code = v_code;
   update hideseek.players
      set status = 'active', caught_at = null, caught_by = null, jam_armed = false, jammers_left = 0,
-         outside_since = null, tag_code = null
+         outside_since = null, tag_code = null,
+         catch_block_until = null, immune_until = null, safe_away_since = null
    where room_code = v_code;
   delete from hideseek.pings where room_code = v_code;
+  delete from hideseek.safe_points where room_code = v_code;
+  delete from hideseek.fixes where player_id in (select id from hideseek.players where room_code = v_code);
 end $$;
 
 create function public.hs_leave(p_code text, p_pid uuid, p_secret uuid) returns void
@@ -479,17 +750,18 @@ begin
   perform hideseek.remove_player(v_code, p_target);
 end $$;
 
--- The heartbeat. Each phone calls this every couple of seconds: it reports its own
+-- The heartbeat. Each phone calls this every second during a game: it reports its own
 -- position and gets back exactly what that player is allowed to see.
+-- p_v is the site's version. Copies older than 2 cannot draw safe points, so they never claim one.
 create function public.hs_state(p_code text, p_pid uuid, p_secret uuid,
   p_lat double precision default null, p_lng double precision default null, p_acc real default null,
-  p_after_event bigint default 0)
+  p_after_event bigint default 0, p_v integer default 1)
 returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
   v_code text := upper(p_code);
-  me hideseek.players; r hideseek.rooms; z record;
-  v_hunter boolean; v_seeking boolean; v_out timestamptz;
-  j_players jsonb; j_pos jsonb; j_pings jsonb; j_events jsonb;
+  me hideseek.players; r hideseek.rooms; z record; sp hideseek.safe_points;
+  v_hunter boolean; v_seeking boolean; v_out timestamptz; v_holder uuid;
+  j_players jsonb; j_pos jsonb; j_pings jsonb; j_events jsonb; j_safe jsonb;
 begin
   me := hideseek.auth(v_code, p_pid, p_secret);
   perform hideseek.tick(v_code);
@@ -498,6 +770,15 @@ begin
   select * into me from hideseek.players where id = p_pid;
 
   if p_lat is not null and p_lng is not null then
+    if r.status = 'playing' then
+      -- safe_step can take the room lock, so it runs before this call touches its own rows
+      if me.role = 'hider' and me.status = 'active' then
+        perform hideseek.safe_step(r, me, p_lat, p_lng, p_acc, coalesce(p_v, 1) >= 2);
+      end if;
+      insert into hideseek.fixes(player_id, at, lat, lng, acc)
+      values (me.id, now(), p_lat, p_lng, p_acc) on conflict do nothing;
+      delete from hideseek.fixes where player_id = me.id and at < now() - interval '30 seconds';
+    end if;
     v_out := null;
     if r.status = 'playing' and me.role = 'hider' and me.status = 'active' and z.radius is not null
        and hideseek.dist_m(p_lat, p_lng, z.lat, z.lng) > z.radius + least(coalesce(p_acc, 0), 20) then
@@ -513,27 +794,46 @@ begin
   v_hunter := me.role = 'seeker' or me.status = 'caught';
   v_seeking := r.status = 'playing' and now() >= r.seek_at;
 
+  -- hiders see a safe point from the moment it opens; hunters only once somebody holds it
+  if r.status = 'playing' then
+    select * into sp from hideseek.safe_points where room_code = v_code and ended_at is null;
+    if found then
+      v_holder := sp.claimed_by;
+      if v_holder is not null or not v_hunter then
+        j_safe := jsonb_build_object(
+          'id', sp.id, 'lat', sp.lat, 'lng', sp.lng, 'r', sp.radius_m,
+          'expires_at', hideseek.ms(sp.expires_at), 'claimed_by', v_holder);
+      end if;
+    end if;
+  end if;
+
   select coalesce(jsonb_agg(jsonb_build_object(
            'id', p.id, 'name', p.name, 'color', p.color, 'role', p.role, 'status', p.status,
            'host', p.id = r.host_id,
            'online', p.last_seen > now() - interval '20 seconds',
            'gps', p.loc_at is not null and p.loc_at > now() - interval '45 seconds',
            'caught_at', hideseek.ms(p.caught_at),
-           'caught_by', (select c.name from hideseek.players c where c.id = p.caught_by)
+           'caught_by', (select c.name from hideseek.players c where c.id = p.caught_by),
+           'safe', coalesce(p.id = v_holder, false),
+           'immune_until', case when p.immune_until > now() then hideseek.ms(p.immune_until) end
          ) order by p.joined_at), '[]'::jsonb)
     into j_players from hideseek.players p where p.room_code = v_code;
 
-  -- live positions: hunters see each other, plus any hider who has been outside the zone for 20s
+  -- live positions: hunters see each other, any hider who has been outside the zone for 20s,
+  -- and whoever holds the safe point. In return the holder sees every hunter.
   select coalesce(jsonb_agg(jsonb_build_object(
            'id', p.id, 'lat', p.lat, 'lng', p.lng, 'acc', p.acc,
            'age', extract(epoch from now() - p.loc_at)::int,
-           'exposed', r.status = 'playing' and p.role = 'hider' and p.status = 'active')), '[]'::jsonb)
+           'exposed', r.status = 'playing' and p.role = 'hider' and p.status = 'active',
+           'safe', coalesce(p.id = v_holder, false))), '[]'::jsonb)
     into j_pos from hideseek.players p
    where p.room_code = v_code and p.id <> me.id and p.lat is not null
      and ( r.status = 'ended'
         or ( r.status = 'playing' and v_hunter and (
                p.role = 'seeker' or p.status = 'caught'
-               or (v_seeking and p.outside_since is not null and p.outside_since < now() - interval '20 seconds'))));
+               or p.id = v_holder
+               or (v_seeking and p.outside_since is not null and p.outside_since < now() - interval '20 seconds')))
+        or ( r.status = 'playing' and me.id = v_holder and (p.role = 'seeker' or p.status = 'caught')));
 
   select coalesce(jsonb_agg(jsonb_build_object(
            'seq', g.seq, 'id', g.player_id, 'role', g.role, 'lat', g.lat, 'lng', g.lng,
@@ -565,14 +865,20 @@ begin
         'zone_lat', r.zone_lat, 'zone_lng', r.zone_lng, 'zone_radius_m', r.zone_radius_m,
         'final_pct', r.final_pct, 'hide_seconds', r.hide_seconds, 'game_seconds', r.game_seconds,
         'ping_min_s', r.ping_min_s, 'ping_max_s', r.ping_max_s, 'ping_fuzz_m', r.ping_fuzz_m,
-        'reveal_seekers', r.reveal_seekers, 'jammers', r.jammers)),
+        'reveal_seekers', r.reveal_seekers, 'jammers', r.jammers, 'catch_m', r.catch_m,
+        'safe_min_s', r.safe_min_s, 'safe_max_s', r.safe_max_s, 'safe_seconds', r.safe_seconds)),
     'me', jsonb_build_object(
       'id', me.id, 'name', me.name, 'color', me.color, 'role', me.role, 'status', me.status,
       'host', me.id = r.host_id, 'tag_code', me.tag_code,
       'jammers_left', me.jammers_left, 'jam_armed', me.jam_armed,
       'outside', me.outside_since is not null,
       'outside_s', extract(epoch from now() - me.outside_since)::int,
-      'exposed', v_seeking and me.outside_since is not null and me.outside_since < now() - interval '20 seconds'),
+      'exposed', v_seeking and me.outside_since is not null and me.outside_since < now() - interval '20 seconds',
+      'on_safe', coalesce(me.id = v_holder, false),
+      'safe_away', me.safe_away_since is not null,
+      'immune_until', case when me.immune_until > now() then hideseek.ms(me.immune_until) end,
+      'catch_wait_until', case when me.catch_block_until > now() then hideseek.ms(me.catch_block_until) end),
+    'safe', j_safe,
     'players', j_players, 'positions', j_pos, 'pings', j_pings, 'events', j_events);
 end $$;
 
