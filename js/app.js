@@ -48,6 +48,7 @@ const fresh = () => ({
   view: null, phase: null, failures: 0,
   editAt: 0, pending: null, saveT: null,
   fitted: false, centered: false, autoZoned: false, pinSig: null, lastTick: null,
+  armed: null, catching: false, catchErr: null,   // the "found you" button: confirm tap, request in flight, last refusal
 });
 let S = fresh();
 const G = { pos: null, err: null, watch: null };   // GPS outlives a room
@@ -79,11 +80,12 @@ function toast(msg, kind = '') {
 }
 
 let flashT = null;
-function flash(big, small, quiet = false) {
+// quiet: shorter, for moments a hider should not be given away by. tone 'safe': blue, for safe points.
+function flash(big, small, { quiet = false, tone = '' } = {}) {
   const f = $('flash');
   $('flash-big').textContent = big;
   $('flash-small').textContent = small;
-  f.className = quiet ? 'flash quiet' : 'flash';
+  f.className = ['flash', quiet ? 'quiet' : '', tone, big.length > 4 ? 'long' : ''].filter(Boolean).join(' ');
   f.hidden = false;
   f.style.animation = 'none';
   void f.offsetWidth;            // restart the animation
@@ -202,12 +204,12 @@ async function poll() {
   if (!S.code) return;
   if (inFlight) { again = true; return; }
   inFlight = true;
-  const code = S.code;
+  const code = S.code, sentAt = Date.now();
   try {
     const st = await rpc('hs_state', {
       p_code: code, p_pid: S.pid, p_secret: secret,
       p_lat: G.pos?.lat ?? null, p_lng: G.pos?.lng ?? null, p_acc: G.pos?.acc ?? null,
-      p_after_event: S.lastEvent,
+      p_after_event: S.lastEvent, p_v: 2,
     });
     if (S.code === code) { S.failures = 0; apply(st); }
   } catch (e) {
@@ -220,7 +222,9 @@ async function poll() {
   inFlight = false;
   if (!S.code) return;
   if (again) { again = false; poll(); return; }
-  pollT = setTimeout(poll, S.st?.room.status === 'playing' ? 2000 : 2500);
+  // During a game every phone reports once a second: that track is what catches are checked against.
+  const every = S.st?.room.status === 'playing' ? 1000 : 2500;
+  pollT = setTimeout(poll, Math.max(150, every - (Date.now() - sentAt)));
 }
 
 // Runs a game action for this player, then refreshes straight away.
@@ -264,11 +268,14 @@ function apply(st) {
 
 function onEvent(e, st) {
   const d = e.data || {};
+  const hunting = S.view === 'hunter', hiding = S.view === 'hider';
   if (e.kind === 'caught') {
     sound.caught();
     if (d.id === st.me.id) {
-      vibrate([500]);
-      toast('You are caught. You hunt with the seeker now.');
+      vibrate([500, 150, 500]);
+      const next = st.room.status === 'playing' ? ' You hunt with them now.' : '';
+      if (d.by) flash('Caught', `${d.by} found you.${next}`);
+      else toast('You are out. You hunt with the seeker now.');
     } else {
       toast(d.by ? `${d.name} was caught by ${d.by}.` : `${d.name} gave up.`);
     }
@@ -276,6 +283,41 @@ function onEvent(e, st) {
     toast(`${d.name} joined.`);
   } else if (e.kind === 'left') {
     toast(`${d.name} left.`);
+  } else if (e.kind === 'safe_spawn') {
+    if (hiding) {
+      sound.blip();
+      vibrate([150, 80, 150]);
+      flash('Safe', `A safe point just opened. The first hider inside is safe for ${dur(st.room.settings.safe_seconds)}.`, { quiet: true, tone: 'safe' });
+      fitSafe();
+    } else if (hunting) {
+      toast('A safe point just opened for the hiders. They may be on the move.');
+    }
+  } else if (e.kind === 'safe_claim') {
+    if (d.id === st.me.id) {
+      sound.start();
+      vibrate([200, 100, 200]);
+      flash('Safe', `Nobody can catch you for ${dur(st.room.settings.safe_seconds)}. You see the seekers live, and they see you. Plus one jammer.`, { tone: 'safe' });
+    } else if (hunting) {
+      sound.warn();
+      vibrate([300]);
+      flash('Safe', `${d.name} took a safe point. They are live on your map, but you cannot catch them yet.`, { quiet: true, tone: 'safe' });
+      fitSafe();
+    } else {
+      toast(`${d.name} took the safe point.`);
+    }
+  } else if (e.kind === 'safe_end' && d.reason !== 'gone') {
+    if (d.reason === 'expired') {
+      toast(hunting ? 'The safe point closed. Nobody reached it.' : 'The safe point closed.');
+    } else if (d.id === st.me.id) {
+      sound.warn();
+      vibrate([400, 100, 400]);
+      flash('Run', `${d.reason === 'left' ? 'You left the safe point.' : 'Your safe point ran out.'} Nobody can catch you for 30 seconds.`, { tone: 'safe' });
+    } else if (hunting) {
+      sound.blip();
+      toast(`${d.name} is off the safe point. You can catch them in 30 seconds.`);
+    } else {
+      toast(`${d.name}'s safe point is over.`);
+    }
   }
 }
 
@@ -293,7 +335,7 @@ function onPing(st) {
     const mine = latest.find((g) => g.id === st.me.id);
     sound.blip();
     vibrate([200, 100, 200]);
-    flash('Ping', mine?.jammed ? 'Jammed. The seeker got nothing on you.' : 'The seeker just saw where you are.', true);
+    flash('Ping', mine?.jammed ? 'Jammed. The seeker got nothing on you.' : 'The seeker just saw where you are.', { quiet: true });
   }
 }
 
@@ -337,7 +379,7 @@ function startGps() {
   G.watch = navigator.geolocation.watchPosition(
     (p) => setPos(p.coords.latitude, p.coords.longitude, p.coords.accuracy),
     (err) => { G.err = err.code === 1 ? 'denied' : 'unavailable'; renderBanner(); },
-    { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 },
+    { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 },
   );
 }
 
@@ -372,6 +414,8 @@ function initMap() {
   layer.zone0 = L.circle([0, 0], { radius: 1, weight: 1.5, dashArray: '4 7', fill: false, interactive: false });
   layer.zone = L.circle([0, 0], { radius: 1, weight: 4, fill: false, interactive: false });
   layer.acc = L.circle([0, 0], { radius: 1, weight: 0, fillOpacity: 0.12, interactive: false });
+  layer.safe = L.circle([0, 0], { radius: 1, weight: 3, dashArray: '6 6', fillOpacity: 0.22, interactive: false });
+  layer.safeTag = L.marker([0, 0], { interactive: false, zIndexOffset: 300 });
   layer.pins = L.layerGroup().addTo(map);
   layer.live = L.layerGroup().addTo(map);
   layer.me = L.marker([0, 0], { interactive: false, zIndexOffset: 1000 });
@@ -388,7 +432,7 @@ function initMap() {
 }
 
 function resetMap() {
-  for (const k of ['mask', 'zone0', 'zone', 'acc', 'me']) layer[k].remove();
+  for (const k of ['mask', 'zone0', 'zone', 'acc', 'safe', 'safeTag', 'me']) layer[k].remove();
   layer.pins.clearLayers();
   layer.live.clearLayers();
   updateMe();
@@ -435,6 +479,14 @@ function fitPings(pings) {
   if (G.pos) pts.push([G.pos.lat, G.pos.lng]);
   map.fitBounds(L.latLngBounds(pts).pad(0.25), { ...fitPad(), maxZoom: 18 });
 }
+// Frames the safe point together with where you are standing.
+function fitSafe() {
+  const sf = S.st?.safe;
+  if (!map || !sf) return;
+  const b = L.latLng(sf.lat, sf.lng).toBounds(sf.r * 2);
+  if (G.pos) b.extend([G.pos.lat, G.pos.lng]);
+  map.fitBounds(b.pad(0.2), { ...fitPad(), maxZoom: 18 });
+}
 
 const playersById = (st) => Object.fromEntries(st.players.map((p) => [p.id, p]));
 
@@ -451,8 +503,24 @@ function renderMap(st) {
     layer.zone.remove(); layer.zone0.remove(); layer.mask.remove();
   }
   updateMe();
+  renderSafe(st);
   renderPins(st);
   renderLive(st);
+}
+
+// The safe point is drawn as its whole circle: anywhere inside counts.
+// The server only sends it to hunters once a hider is holding it.
+function renderSafe(st) {
+  const sf = st.room.status === 'playing' ? st.safe : null;
+  $('tool-safe').hidden = !sf;
+  if (!sf) { layer.safe.remove(); layer.safeTag.remove(); return; }
+  const blue = getComputedStyle(document.body).getPropertyValue('--water').trim() || '#2b7fd9';
+  const holder = sf.claimed_by ? playersById(st)[sf.claimed_by] : null;
+  const label = !sf.claimed_by ? 'Safe point' : sf.claimed_by === st.me.id ? 'Safe point · yours' : `Safe point · ${holder?.name || 'taken'}`;
+  layer.safe.setLatLng([sf.lat, sf.lng]).setRadius(sf.r)
+    .setStyle({ color: blue, fillColor: blue, dashArray: sf.claimed_by ? null : '6 6' }).addTo(map);
+  if (layer.safeTag._label !== label) { layer.safeTag._label = label; layer.safeTag.setIcon(pinIcon('safe', blue, label)); }
+  layer.safeTag.setLatLng([sf.lat + sf.r / 111320, sf.lng]).addTo(map);   // sits on the circle's north edge
 }
 
 // Ping snapshots. Hunters see hiders' flags (the last three pings, linked as a trail);
@@ -490,15 +558,20 @@ function renderPins(st) {
   }
 }
 
-// Live positions: fellow hunters, hiders exposed outside the zone, and everyone once it's over.
+// Live positions: fellow hunters, hiders exposed outside the zone, whoever holds the safe
+// point (who in turn sees the hunters), and everyone once it's over.
 function renderLive(st) {
   layer.live.clearLayers();
-  const by = playersById(st);
+  const by = playersById(st), hiding = S.view === 'hider';
   for (const q of st.positions) {
     const p = by[q.id];
     if (!p) continue;
-    const icon = q.exposed ? pinIcon('flag live', p.color, `${p.name} · live`) : pinIcon('dot', p.color, p.name);
-    L.marker([q.lat, q.lng], { icon, interactive: false, zIndexOffset: q.exposed ? 800 : 200 }).addTo(layer.live);
+    let icon;
+    if (q.safe) icon = pinIcon('flag live held', p.color, `${p.name} · safe`);
+    else if (q.exposed) icon = pinIcon('flag live', p.color, `${p.name} · live`);
+    else if (hiding) icon = pinIcon('tri live', p.color, `${p.name} · live`);   // a hunter, seen from the safe point
+    else icon = pinIcon('dot', p.color, p.name);
+    L.marker([q.lat, q.lng], { icon, interactive: false, zIndexOffset: q.exposed || hiding ? 800 : 200 }).addTo(layer.live);
   }
 }
 
@@ -512,7 +585,12 @@ const RULES = [
   ['final_pct', 'Zone shrinks to', [[10, '10% of its size'], [15, '15% of its size'], [25, '25% of its size'], [40, '40% of its size']]],
   ['jammers', 'Jammers per hider', [[0, 'None'], [1, '1'], [2, '2']]],
   ['reveal_seekers', 'Pings show hiders the seeker', [['true', 'Yes'], ['false', 'No']]],
+  ['catch_m', 'Catch distance', [[2, '2 m'], [3, '3 m'], [5, '5 m'], [10, '10 m']]],
+  ['safe', 'Safe points open', [['0-0', 'Never'], ['120-240', 'Every 2–4 min'], ['240-420', 'Every 4–7 min'], ['480-720', 'Every 8–12 min']]],
+  ['safe_seconds', 'Safe point protects for', [[60, '1 min'], [120, '2 min'], [180, '3 min'], [300, '5 min']]],
 ];
+// settings stored as a "min-max" pair of seconds behind one dropdown
+const PAIRS = { ping: ['ping_min_s', 'ping_max_s'], safe: ['safe_min_s', 'safe_max_s'] };
 const rulesEl = $('rules'), radiusEl = $('radius');
 rulesEl.innerHTML = RULES.map(([key, label, opts]) => `
   <label class="field"><span>${label}</span>
@@ -547,7 +625,7 @@ rulesEl.addEventListener('change', (e) => {
   const sel = e.target.closest('select');
   if (!sel || !S.st) return;
   const key = sel.dataset.key, v = sel.value;
-  if (key === 'ping') { const [a, b] = v.split('-').map(Number); editSettings({ ping_min_s: a, ping_max_s: b }); }
+  if (PAIRS[key]) { const [a, b] = v.split('-').map(Number); editSettings({ [PAIRS[key][0]]: a, [PAIRS[key][1]]: b }); }
   else if (key === 'reveal_seekers') editSettings({ reveal_seekers: v === 'true' });
   else editSettings({ [key]: Number(v) });
 });
@@ -560,10 +638,11 @@ $('btn-zone-me').addEventListener('click', () => {
 });
 
 function syncControls(s) {
-  const vals = { ...s, ping: `${s.ping_min_s}-${s.ping_max_s}`, reveal_seekers: String(s.reveal_seekers) };
+  const vals = { ...s, reveal_seekers: String(s.reveal_seekers) };
+  for (const [key, [a, b]] of Object.entries(PAIRS)) vals[key] = `${s[a]}-${s[b]}`;
   for (const sel of rulesEl.querySelectorAll('select')) {
     const v = String(vals[sel.dataset.key]);
-    if (![...sel.options].some((o) => o.value === v)) sel.add(new Option(v.replace('-', '–') + (sel.dataset.key === 'ping' ? ' s' : ''), v));
+    if (![...sel.options].some((o) => o.value === v)) sel.add(new Option(v.replace('-', '–') + (PAIRS[sel.dataset.key] ? ' s' : ''), v));
     if (sel.value !== v && document.activeElement !== sel) sel.value = v;
   }
   if (document.activeElement !== radiusEl) radiusEl.value = s.zone_radius_m;
@@ -578,6 +657,10 @@ function summary(s) {
     `Zone: ${meters(s.zone_radius_m)} radius, shrinking to ${s.final_pct}%`,
     s.jammers ? `Jammers: ${s.jammers} per hider` : 'No jammers',
     s.reveal_seekers ? 'Each ping also shows hiders where the seeker is' : 'Hiders never see the seeker',
+    `Catching: get within ${s.catch_m} m of a hider and tap Found next to their name`,
+    s.safe_max_s
+      ? `A safe point opens every ${dur(s.safe_min_s)} to ${dur(s.safe_max_s)}. The first hider inside is safe for ${dur(s.safe_seconds)}, sees the seekers live and gets a jammer`
+      : 'No safe points',
   ].map((t) => `<li>${esc(t)}</li>`).join('');
 }
 
@@ -597,8 +680,8 @@ function render() {
 
   if (view === 'lobby') renderLobby(st);
   else if (view === 'hider') renderHider(st);
-  else if (view === 'hunter') renderHunter(st);
-  else renderEnded(st);
+  else if (view === 'ended') renderEnded(st);
+  // the hunter's panel is all countdowns, so tick() draws it
 
   renderMap(st);
   renderBanner();
@@ -646,15 +729,65 @@ function renderLobby(st) {
 function renderHider(st) {
   setText($('tag-code'), st.me.tag_code || '----');
   const jam = $('btn-jam'), s = st.room.settings;
-  jam.hidden = !s.jammers;
+  // a safe point hands out a jammer even when the rules give none
+  jam.hidden = !s.jammers && !st.me.jammers_left && !st.me.jam_armed;
   if (st.me.jam_armed) { jam.disabled = true; setText(jam, 'Jammer armed for the next ping'); }
   else if (st.me.jammers_left > 0) { jam.disabled = false; setText(jam, `Jam the next ping (${st.me.jammers_left} left)`); }
   else { jam.disabled = true; setText(jam, 'No jammers left'); }
 }
 
-function renderHunter(st) {
-  setHTML($('hider-chips'), st.players.filter((p) => p.role === 'hider').map((p) =>
-    `<li class="${p.status}"><i class="dot" style="--c:${p.color}"></i>${esc(p.name)}</li>`).join(''));
+// The hunter's list of hiders. "Found" asks the server to judge the catch: it compares
+// both phones' hidden tracks and answers yes or no, never how far apart they were.
+function renderTargets(st, t, phase) {
+  const me = st.me;
+  const waiting = (me.catch_wait_until || 0) > t;
+  const ready = phase === 'seek' && !waiting && !S.catching;
+  if (S.armed && Date.now() > S.armed.until) S.armed = null;
+
+  setHTML($('targets'), st.players.filter((p) => p.role === 'hider').map((p) => {
+    const who = `<i class="dot" style="--c:${p.color}"></i><span class="pname">${esc(p.name)}</span>`;
+    if (p.status !== 'active') return `<li class="target out">${who}<span class="tstate">Caught</span></li>`;
+    const until = p.safe ? st.safe?.expires_at : p.immune_until;
+    if (p.safe || until > t) {
+      const left = until > t ? ` · ${mmss(until - t)}` : '';
+      return `<li class="target shielded">${who}<span class="tstate">${p.safe ? 'On a safe point' : 'Getaway'}${left}</span></li>`;
+    }
+    const armed = S.armed?.id === p.id;
+    return `<li class="target">${who}<button class="btn btn-sm ${armed ? 'btn-course' : 'btn-line'}" type="button" data-id="${p.id}"${ready ? '' : ' disabled'}>${armed ? 'Tap again to confirm' : 'Found'}</button></li>`;
+  }).join(''));
+
+  if (S.catchErr && Date.now() > S.catchErr.until) S.catchErr = null;
+  const text = waiting
+    ? `Too far away to count. You can call again in ${mmss(me.catch_wait_until - t)}.`
+    : S.catchErr?.msg || '';
+  $('catch-msg').hidden = !text;
+  setText($('catch-msg'), text);
+}
+
+async function callFound(id) {
+  if (S.catching) return;
+  const room = S.code;
+  S.catching = true;
+  S.catchErr = null;
+  tick();
+  try {
+    const r = await rpc('hs_catch', { p_code: room, p_pid: S.pid, p_secret: secret, p_target: id });
+    if (S.code === room) {
+      if (r.caught) {
+        vibrate([200, 80, 200]);
+        flash('Caught', `You found ${r.name}.`);
+      } else {
+        S.st.me.catch_wait_until = r.wait_until;
+        sound.warn();
+        vibrate([300]);
+      }
+      poll();
+    }
+  } catch (ex) {
+    if (S.code === room) S.catchErr = { msg: friendly(ex), until: Date.now() + 6000 };
+  }
+  S.catching = false;
+  tick();
 }
 
 function renderEnded(st) {
@@ -733,7 +866,7 @@ function tick() {
   }
 
   if (S.view === 'hider') {
-    const me = st.me, el = $('hider-status');
+    const me = st.me, el = $('hider-status'), sf = st.safe;
     let cls = 'ok', msg;
     if (me.exposed) { cls = 'bad'; msg = 'Exposed. The seeker sees you live until you are back inside the zone.'; }
     else if (me.outside) {
@@ -741,11 +874,29 @@ function tick() {
       msg = phase === 'seek'
         ? `Outside the zone. The seeker sees you live in ${Math.max(0, 20 - (me.outside_s || 0))} s.`
         : 'Outside the zone. Get inside before the head start ends.';
+    } else if (me.on_safe && sf) {
+      cls = me.safe_away ? 'warn' : 'safe';
+      msg = me.safe_away
+        ? 'You are drifting off the safe point. Step back inside or you lose it.'
+        : `Safe for ${mmss(sf.expires_at - t)}. Nobody can catch you here. The seekers see you live, and you see them.`;
+    } else if (me.immune_until > t) {
+      cls = 'safe';
+      msg = `Getaway: nobody can catch you for ${mmss(me.immune_until - t)}. Move.`;
     } else if (!G.pos) { cls = 'warn'; msg = 'No GPS fix. Pings will show your last known spot.'; }
     else if (r.zone) msg = `Inside the zone. The edge is ${meters(Math.max(0, r.zone.r - dist(G.pos, r.zone)))} away.`;
     else msg = 'Inside the zone.';
     el.className = `status ${cls}`;
     setText(el, msg);
+
+    let note = '';
+    if (sf && !sf.claimed_by) {
+      const away = G.pos ? `${meters(Math.max(0, dist(G.pos, sf) - sf.r))} away` : 'on your map';
+      note = `Safe point open, ${away}. The first hider inside is safe for ${dur(r.settings.safe_seconds)}, sees the seekers live and gets a jammer. It closes in ${mmss(sf.expires_at - t)}.`;
+    } else if (sf && !me.on_safe) {
+      note = `${playersById(st)[sf.claimed_by]?.name || 'Another hider'} holds the safe point for ${mmss(sf.expires_at - t)}.`;
+    }
+    $('hider-safe').hidden = !note;
+    setText($('hider-safe'), note);
 
     const mine = st.pings.filter((g) => g.id === me.id && g.role === 'hider').at(-1);
     let line;
@@ -770,6 +921,7 @@ function tick() {
     const el = $('hunter-status');
     el.className = 'status seek';
     setText(el, msg);
+    renderTargets(st, t, phase);
   }
 }
 setInterval(tick, 250);
@@ -810,6 +962,17 @@ $('btn-jam').addEventListener('click', async () => {
 });
 $('btn-caught').addEventListener('click', (e) => confirmTap(e.currentTarget, 'Tap again to confirm', () => act('hs_give_up')));
 
+// "Found": the first tap arms that hider's button, the second sends the call.
+// The armed state lives in S because this list is redrawn as its countdowns move.
+$('targets').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-id]');
+  if (!b || b.disabled) return;
+  const id = b.dataset.id;
+  if (S.armed?.id !== id) { S.armed = { id, until: Date.now() + 3000 }; tick(); return; }
+  S.armed = null;
+  callFound(id);
+});
+
 $('tag-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const input = $('tag-input'), err = $('tag-error');
@@ -849,6 +1012,7 @@ $('tool-me').addEventListener('click', () => {
   map.setView([G.pos.lat, G.pos.lng], Math.max(map.getZoom(), 17));
 });
 $('tool-zone').addEventListener('click', () => { if (S.st?.room.zone) fitZone(); else toast('No zone has been placed yet.'); });
+$('tool-safe').addEventListener('click', fitSafe);
 
 function setNight(on) {
   document.body.toggleAttribute('data-night', on);
