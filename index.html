@@ -6,6 +6,11 @@
   <title>Lay Low — hide and seek on a shrinking map</title>
   <meta name="description" content="GPS hide and seek for you and your friends. The zone shrinks, and every few minutes the seeker gets a ping.">
   <meta name="theme-color" content="#ffffff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Scram">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="format-detection" content="telephone=no">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23fff'/%3E%3Ccircle cx='16' cy='16' r='10' fill='none' stroke='%23C2188B' stroke-width='4'/%3E%3Ccircle cx='19' cy='14' r='3' fill='%23171A2B'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -60,7 +65,7 @@
       <div class="join">
         <label class="field">
           <span>Have a code?</span>
-          <input id="join-code" class="mono" type="text" maxlength="4" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="ABCD">
+          <input id="join-code" class="mono" type="text" maxlength="4" autocapitalize="characters" autocomplete="off" spellcheck="false" enterkeyhint="go" placeholder="ABCD">
         </label>
         <button type="submit" id="btn-join" class="btn btn-course">Join room</button>
       </div>
@@ -113,7 +118,10 @@
   <div id="toasts" class="toasts" aria-live="polite"></div>
 
   <section class="sheet" id="sheet" aria-label="Game panel">
-    <button class="grip" id="grip" type="button" aria-label="Show or hide the panel" aria-expanded="true"></button>
+    <button class="grip" id="grip" type="button" aria-label="Show or hide the panel" aria-expanded="true">
+      <span class="grip-bar"></span>
+      <span class="grip-hint">Game details &amp; controls <span class="grip-arrow">▲</span></span>
+    </button>
     <div class="sheet-body">
 
       <div id="view-lobby" hidden>
@@ -184,7 +192,7 @@
           <form id="tag-form" class="tag-form" novalidate>
             <label class="field">
               <span>Hider's tag code</span>
-              <input id="tag-input" class="mono" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" placeholder="0000">
+              <input id="tag-input" class="mono" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" enterkeyhint="done" placeholder="0000">
             </label>
             <button class="btn btn-ink" type="submit">Tag them</button>
           </form>

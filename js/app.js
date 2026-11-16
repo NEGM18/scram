@@ -928,9 +928,39 @@ setInterval(tick, 250);
 
 // ---------------------------------------------------------------- buttons
 
-$('grip').addEventListener('click', () => {
+const gripEl = $('grip');
+gripEl.addEventListener('click', () => {
   const collapsed = $('sheet').classList.toggle('collapsed');
-  $('grip').setAttribute('aria-expanded', String(!collapsed));
+  gripEl.setAttribute('aria-expanded', String(!collapsed));
+});
+
+// Mobile touch swipe gestures for the bottom sheet
+let touchStartY = 0, touchDiffY = 0;
+gripEl.addEventListener('touchstart', (e) => {
+  touchStartY = e.touches[0].clientY;
+  touchDiffY = 0;
+}, { passive: true });
+
+gripEl.addEventListener('touchmove', (e) => {
+  touchDiffY = e.touches[0].clientY - touchStartY;
+}, { passive: true });
+
+gripEl.addEventListener('touchend', () => {
+  const isCollapsed = $('sheet').classList.contains('collapsed');
+  if (!isCollapsed && touchDiffY > 35) {
+    $('sheet').classList.add('collapsed');
+    gripEl.setAttribute('aria-expanded', 'false');
+  } else if (isCollapsed && touchDiffY < -20) {
+    $('sheet').classList.remove('collapsed');
+    gripEl.setAttribute('aria-expanded', 'true');
+  }
+});
+
+window.addEventListener('resize', () => {
+  if (map) map.invalidateSize();
+});
+window.addEventListener('orientationchange', () => {
+  if (map) setTimeout(() => map.invalidateSize(), 150);
 });
 
 $('btn-invite').addEventListener('click', async () => {
